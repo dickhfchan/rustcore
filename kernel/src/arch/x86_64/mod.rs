@@ -6,11 +6,17 @@ pub fn init() {
 
     unsafe {
         serial::init();
+        serial::write_bytes(b"arch: serial ready\n");
         pic::init();
+        serial::write_bytes(b"arch: pic init\n");
         paging::init();
+        serial::write_bytes(b"arch: paging init\n");
         descriptor::init();
+        serial::write_bytes(b"arch: descriptor init\n");
         interrupts::init();
+        serial::write_bytes(b"arch: idt init\n");
         pit::start_periodic(100); // 100 Hz tick for scheduler bookkeeping
+        serial::write_bytes(b"arch: pit started\n");
     }
 }
 
@@ -175,7 +181,7 @@ mod interrupts {
 
     use crate::sync::SpinLock;
 
-    use super::{descriptor::KERNEL_CODE_SELECTOR, pic};
+    use super::{descriptor::KERNEL_CODE_SELECTOR, pic, serial};
 
     #[repr(C, packed)]
     struct DescriptorTablePointer {
@@ -220,6 +226,21 @@ mod interrupts {
                 reserved: 0,
             }
         }
+
+        fn with_handler_err(handler: HandlerFuncWithErr, dpl: u16) -> Self {
+            let ptr = handler as usize as u64;
+            let mut options: u16 = 0x8E00;
+            options |= (dpl & 0x3) << 13;
+
+            Self {
+                offset_low: ptr as u16,
+                selector: KERNEL_CODE_SELECTOR,
+                options,
+                offset_mid: (ptr >> 16) as u16,
+                offset_high: (ptr >> 32) as u32,
+                reserved: 0,
+            }
+        }
     }
 
     #[repr(C, align(16))]
@@ -237,6 +258,10 @@ mod interrupts {
         fn set_handler(&mut self, vector: InterruptVector, handler: HandlerFunc, dpl: u16) {
             self.entries[vector as usize] = IdtEntry::with_handler(handler, dpl);
         }
+
+        fn set_handler_err(&mut self, vector: InterruptVector, handler: HandlerFuncWithErr, dpl: u16) {
+            self.entries[vector as usize] = IdtEntry::with_handler_err(handler, dpl);
+        }
     }
 
     static mut IDT: Idt = Idt::new();
@@ -246,6 +271,7 @@ mod interrupts {
     static TIMER_TICKS: AtomicU64 = AtomicU64::new(0);
 
     pub type HandlerFunc = extern "x86-interrupt" fn(&mut InterruptStackFrame);
+    pub type HandlerFuncWithErr = extern "x86-interrupt" fn(&mut InterruptStackFrame, u64);
 
     #[repr(C)]
     pub struct InterruptStackFrame {
@@ -258,7 +284,10 @@ mod interrupts {
 
     #[repr(u8)]
     pub enum InterruptVector {
+        GeneralProtection = 13,
         Timer = 32,
+        PrimarySpurious = 0x27,
+        SecondarySpurious = 0x2F,
         Ipc = 0x80,
     }
 
@@ -266,6 +295,9 @@ mod interrupts {
     pub(super) unsafe fn init() {
         IDT.set_handler(InterruptVector::Timer, timer_trap, 0);
         IDT.set_handler(InterruptVector::Ipc, ipc_trap, 3);
+        IDT.set_handler_err(InterruptVector::GeneralProtection, general_protection_fault, 0);
+        IDT.set_handler(InterruptVector::PrimarySpurious, spurious_trap, 0);
+        IDT.set_handler(InterruptVector::SecondarySpurious, spurious_trap, 0);
 
         let descriptor = DescriptorTablePointer {
             limit: (size_of::<Idt>() - 1) as u16,
@@ -293,10 +325,28 @@ mod interrupts {
         acknowledge(InterruptVector::Ipc);
     }
 
-    fn acknowledge(_vector: InterruptVector) {
-        match _vector {
+    extern "x86-interrupt" fn general_protection_fault(
+        _frame: &mut InterruptStackFrame,
+        error_code: u64,
+    ) {
+        serial::write_bytes(b"general protection fault\n");
+        serial::write_bytes(b"error: ");
+        serial::write_u64_hex(error_code);
+        serial::write_byte(b'\n');
+        super::halt()
+    }
+
+    extern "x86-interrupt" fn spurious_trap(_frame: &mut InterruptStackFrame) {
+        pic::end_of_interrupt(0);
+    }
+
+    fn acknowledge(vector: InterruptVector) {
+        match vector {
             InterruptVector::Timer => pic::end_of_interrupt(0),
-            InterruptVector::Ipc => {}
+            InterruptVector::Ipc => {},
+            InterruptVector::GeneralProtection => {},
+            InterruptVector::PrimarySpurious => {},
+            InterruptVector::SecondarySpurious => {},
         }
     }
 
@@ -386,7 +436,7 @@ mod serial {
     pub(super) unsafe fn init() {
         io::out_u8(COM1 + 1, 0x00); // Disable interrupts
         io::out_u8(COM1 + 3, 0x80); // Enable DLAB
-        io::out_u8(COM1 + 0, 0x03); // Divisor low (38400 baud)
+        io::out_u8(COM1, 0x03); // Divisor low (38400 baud)
         io::out_u8(COM1 + 1, 0x00); // Divisor high
         io::out_u8(COM1 + 3, 0x03); // 8 bits, no parity, one stop
         io::out_u8(COM1 + 2, 0xC7); // Enable FIFO, clear, 14-byte threshold
@@ -403,8 +453,20 @@ mod serial {
         unsafe {
             while (io::in_u8(COM1 + 5) & 0x20) == 0 {}
             io::out_u8(COM1, byte);
-            io::out_u8(0xE9, byte);
         }
+    }
+
+    pub(super) fn write_u64_hex(value: u64) {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut buf = [0u8; 16];
+        let mut idx = 0;
+        while idx < 16 {
+            let shift = (15 - idx) * 4;
+            let nibble = ((value >> shift) & 0xF) as usize;
+            buf[idx] = HEX[nibble];
+            idx += 1;
+        }
+        write_bytes(&buf);
     }
 }
 
@@ -494,7 +556,7 @@ mod pic {
 }
 
 mod pit {
-    use super::{io, pic};
+    use super::io;
 
     const PIT_FREQUENCY_HZ: u64 = 1_193_182;
     const PIT_CHANNEL0: u16 = 0x40;
@@ -505,7 +567,6 @@ mod pit {
         let divisor = (PIT_FREQUENCY_HZ / hz as u64) as u16;
 
         program_counter(divisor);
-        pic::unmask_irq(0);
     }
 
     unsafe fn program_counter(divisor: u16) {
@@ -519,6 +580,10 @@ mod pit {
 pub use interrupts::{
     register_ipc_handler, register_timer_handler, timer_ticks, InterruptStackFrame, InterruptVector,
 };
+
+pub fn unmask_timer_irq() {
+    pic::unmask_irq(0)
+}
 
 pub fn serial_write_line(message: &str) {
     serial::write_bytes(message.as_bytes());

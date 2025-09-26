@@ -5,6 +5,7 @@ QEMU_BIN=${QEMU_BIN:-"qemu-system-x86_64"}
 MACHINE=${MACHINE:-"q35"}
 CPU=${CPU:-"qemu64"}
 DEBUG_LOG=${DEBUG_LOG:-"debug.log"}
+QEMU_EXTRA=${QEMU_EXTRA:-}
 MODE="kernel"
 TARGET_BIN=""
 
@@ -45,4 +46,5 @@ exec "$QEMU_BIN" \
   -serial stdio \
   -debugcon file:"${DEBUG_LOG}" \
   -global isa-debugcon.iobase=0xe9 \
-  -kernel "$TARGET_BIN"
+  -kernel "$TARGET_BIN" \
+  ${QEMU_EXTRA}
