@@ -1,0 +1,1 @@
+/Users/dickchan/projects/rustcore/target/thumbv7em-none-eabi/debug/libinit.rlib: /Users/dickchan/projects/rustcore/ipc/src/channel.rs /Users/dickchan/projects/rustcore/ipc/src/lib.rs /Users/dickchan/projects/rustcore/services/init/src/lib.rs

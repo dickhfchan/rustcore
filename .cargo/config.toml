@@ -1,0 +1,14 @@
+[build]
+target = "targets/x86_64-rustcore.json"
+
+[unstable]
+build-std = ["core", "alloc"]
+build-std-features = ["panic_immediate_abort"]
+
+[target."cfg(all(target_arch = \"x86_64\", target_os = \"none\"))"]
+rustflags = [
+  "-Clink-arg=-Ttargets/x86_64-rustcore.ld",
+  "-Crelocation-model=static",
+  "-Ccode-model=kernel",
+  "-Cpanic=abort",
+]

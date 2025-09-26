@@ -1,0 +1,11 @@
+[package]
+name = "ipc"
+edition = "2021"
+version = "0.1.0"
+authors = ["Rustcore Contributors"]
+
+[lib]
+path = "src/lib.rs"
+test = false
+doctest = false
+bench = false

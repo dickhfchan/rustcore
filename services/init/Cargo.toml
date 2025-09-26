@@ -1,0 +1,14 @@
+[package]
+name = "init"
+edition = "2021"
+version = "0.1.0"
+authors = ["Rustcore Contributors"]
+
+[dependencies]
+ipc = { path = "../../ipc" }
+
+[lib]
+path = "src/lib.rs"
+test = false
+doctest = false
+bench = false

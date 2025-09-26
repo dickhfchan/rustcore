@@ -1,0 +1,27 @@
+[package]
+name = "kernel"
+edition = "2021"
+version = "0.1.0"
+authors = ["Rustcore Contributors"]
+
+[dependencies]
+ipc = { path = "../ipc" }
+services-init = { package = "init", path = "../services/init" }
+
+[lib]
+path = "src/lib.rs"
+test = false
+doctest = false
+bench = false
+
+[[bin]]
+name = "kernel"
+path = "src/bin/kernel.rs"
+test = false
+doctest = false
+bench = false
+
+[[test]]
+name = "boot_smoke"
+path = "tests/boot_smoke.rs"
+harness = false
