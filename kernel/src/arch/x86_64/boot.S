@@ -25,7 +25,7 @@ _start:
     mov %eax, %cr3
 
     mov %cr4, %eax
-    or $0x20, %eax        /* CR4.PAE */
+    or $0x620, %eax        /* CR4.PAE | OSFXSR | OSXMMEXCPT */
     mov %eax, %cr4
 
     mov $0xC0000080, %ecx /* IA32_EFER */
@@ -34,7 +34,7 @@ _start:
     wrmsr
 
     mov %cr0, %eax
-    or $0x80000001, %eax  /* PG | PE */
+    or $0x80000023, %eax  /* PG | PE | MP | NE */
     mov %eax, %cr0
 
     ljmp $0x08, $long_mode_entry
@@ -44,6 +44,14 @@ long_mode_entry:
     movw $0xE9, %dx
     movb $'L', %al
     out %al, %dx
+
+    mov %cr4, %rax
+    or $0x620, %rax
+    mov %rax, %cr4
+
+    mov %cr0, %rax
+    or $0x22, %rax
+    mov %rax, %cr0
 
     mov $0x10, %ax
     mov %ax, %ds

@@ -18,6 +18,8 @@ pub fn init() {
         pit::start_periodic(100); // 100 Hz tick for scheduler bookkeeping
         serial::write_bytes(b"arch: pit started\n");
     }
+
+    enable_simd();
 }
 
 /// Enables maskable interrupts.
@@ -172,14 +174,10 @@ mod descriptor {
 }
 
 mod interrupts {
-    use core::{
-        arch::asm,
-        mem::size_of,
-        ptr,
-        sync::atomic::{AtomicU64, Ordering},
-    };
+    use core::{arch::asm, cell::UnsafeCell, mem::size_of, ptr};
+    use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
-    use crate::sync::SpinLock;
+    use core::num::NonZeroUsize;
 
     use super::{descriptor::KERNEL_CODE_SELECTOR, pic, serial};
 
@@ -266,9 +264,13 @@ mod interrupts {
 
     static mut IDT: Idt = Idt::new();
 
-    static TIMER_CALLBACK: SpinLock<Option<fn()>> = SpinLock::new(None);
-    static IPC_CALLBACK: SpinLock<Option<fn()>> = SpinLock::new(None);
-    static TIMER_TICKS: AtomicU64 = AtomicU64::new(0);
+    static TIMER_CALLBACK: AtomicUsize = AtomicUsize::new(0);
+    static IPC_CALLBACK: AtomicUsize = AtomicUsize::new(0);
+
+    struct TickCell(UnsafeCell<u64>);
+    unsafe impl Sync for TickCell {}
+
+    static TIMER_TICKS: TickCell = TickCell(UnsafeCell::new(0));
 
     pub type HandlerFunc = extern "x86-interrupt" fn(&mut InterruptStackFrame);
     pub type HandlerFuncWithErr = extern "x86-interrupt" fn(&mut InterruptStackFrame, u64);
@@ -308,32 +310,68 @@ mod interrupts {
     }
 
     extern "x86-interrupt" fn timer_trap(_frame: &mut InterruptStackFrame) {
-        TIMER_TICKS.fetch_add(1, Ordering::Relaxed);
+        unsafe {
+            let ptr = TIMER_TICKS.0.get();
+            ptr.write(ptr.read().wrapping_add(1));
+        }
 
-        if let Some(callback) = *TIMER_CALLBACK.lock() {
-            callback();
+        if let Some(func) = load_callback(&TIMER_CALLBACK) {
+            func();
         }
 
         acknowledge(InterruptVector::Timer);
     }
 
     extern "x86-interrupt" fn ipc_trap(_frame: &mut InterruptStackFrame) {
-        if let Some(callback) = *IPC_CALLBACK.lock() {
-            callback();
+        if let Some(func) = load_callback(&IPC_CALLBACK) {
+            func();
         }
 
         acknowledge(InterruptVector::Ipc);
     }
 
+    static GP_FAULT_RIP: AtomicU64 = AtomicU64::new(0);
+    static GP_FAULT_CS: AtomicU64 = AtomicU64::new(0);
+    static GP_FAULT_ERR: AtomicU64 = AtomicU64::new(0);
+    static GP_FAULT_VALID: AtomicBool = AtomicBool::new(false);
+
     extern "x86-interrupt" fn general_protection_fault(
-        _frame: &mut InterruptStackFrame,
+        frame: &mut InterruptStackFrame,
         error_code: u64,
     ) {
+        GP_FAULT_RIP.store(frame.instruction_pointer, Ordering::Relaxed);
+        GP_FAULT_CS.store(frame.code_segment, Ordering::Relaxed);
+        GP_FAULT_ERR.store(error_code, Ordering::Relaxed);
+        GP_FAULT_VALID.store(true, Ordering::Release);
+
+        super::disable_interrupts();
         serial::write_bytes(b"general protection fault\n");
-        serial::write_bytes(b"error: ");
+        serial::write_bytes(b"  rip=");
+        serial::write_u64_hex(frame.instruction_pointer);
+        serial::write_byte(b'\n');
+        serial::write_bytes(b"  cs=");
+        serial::write_u64_hex(frame.code_segment);
+        serial::write_byte(b'\n');
+        serial::write_bytes(b"  err=");
         serial::write_u64_hex(error_code);
         serial::write_byte(b'\n');
-        super::halt()
+
+        // Skip the faulting instruction so we can continue execution and surface the context.
+        frame.instruction_pointer = frame.instruction_pointer.wrapping_add(5);
+
+        super::enable_interrupts();
+    }
+
+    pub fn take_last_gp_fault() -> Option<(u64, u64, u64)> {
+        if GP_FAULT_VALID.swap(false, Ordering::AcqRel) {
+            Some((
+                GP_FAULT_RIP.load(Ordering::Acquire),
+                GP_FAULT_CS.load(Ordering::Acquire),
+                GP_FAULT_ERR.load(Ordering::Acquire),
+            ))
+        } else {
+            None
+        }
     }
 
     extern "x86-interrupt" fn spurious_trap(_frame: &mut InterruptStackFrame) {
@@ -351,15 +389,31 @@ mod interrupts {
     }
 
     pub fn register_timer_handler(callback: fn()) {
-        *TIMER_CALLBACK.lock() = Some(callback);
+        store_callback(&TIMER_CALLBACK, callback);
     }
 
     pub fn register_ipc_handler(callback: fn()) {
-        *IPC_CALLBACK.lock() = Some(callback);
+        store_callback(&IPC_CALLBACK, callback);
     }
 
     pub fn timer_ticks() -> u64 {
-        TIMER_TICKS.load(Ordering::Relaxed)
+        let was_enabled = super::interrupts_enabled();
+        if was_enabled {
+            super::disable_interrupts();
+        }
+        let value = unsafe { *TIMER_TICKS.0.get() };
+        if was_enabled {
+            super::enable_interrupts();
+        }
+        value
+    }
+
+    fn store_callback(slot: &AtomicUsize, callback: fn()) {
+        slot.store(callback as usize, Ordering::SeqCst);
+    }
+
+    fn load_callback(slot: &AtomicUsize) -> Option<fn()> {
+        NonZeroUsize::new(slot.load(Ordering::SeqCst)).map(|nz| unsafe { core::mem::transmute(nz.get()) })
     }
 }
 
@@ -581,6 +635,10 @@ pub use interrupts::{
     register_ipc_handler, register_timer_handler, timer_ticks, InterruptStackFrame, InterruptVector,
 };
 
+pub fn take_last_gp_fault() -> Option<(u64, u64, u64)> {
+    interrupts::take_last_gp_fault()
+}
+
 pub fn unmask_timer_irq() {
     pic::unmask_irq(0)
 }
@@ -588,4 +646,39 @@ pub fn unmask_timer_irq() {
 pub fn serial_write_line(message: &str) {
     serial::write_bytes(message.as_bytes());
     serial::write_byte(b'\n');
+}
+
+pub fn serial_write_bytes(bytes: &[u8]) {
+    serial::write_bytes(bytes);
+}
+
+pub fn serial_write_byte(byte: u8) {
+    serial::write_byte(byte);
+}
+
+fn enable_simd() {
+    unsafe {
+        let mut cr0: u64;
+        asm!("mov {}, cr0", out(reg) cr0, options(nomem, preserves_flags));
+        cr0 |= (1 << 1) | (1 << 5); // MP, NE
+        asm!("mov cr0, {}", in(reg) cr0, options(nomem, preserves_flags));
+
+        let mut cr4: u64;
+        asm!("mov {}, cr4", out(reg) cr4, options(nomem, preserves_flags));
+        cr4 |= (1 << 5) | (1 << 9) | (1 << 10); // ensure PAE, OSFXSR, OSXMMEXCPT
+        asm!("mov cr4, {}", in(reg) cr4, options(nomem, preserves_flags));
+
+        asm!("fninit", options(nomem, preserves_flags));
+
+        let mut cr0_after: u64;
+        let mut cr4_after: u64;
+        asm!("mov {}, cr0", out(reg) cr0_after, options(nomem, preserves_flags));
+        asm!("mov {}, cr4", out(reg) cr4_after, options(nomem, preserves_flags));
+        serial::write_bytes(b"arch: cr0=");
+        serial::write_u64_hex(cr0_after);
+        serial::write_byte(b'\n');
+        serial::write_bytes(b"arch: cr4=");
+        serial::write_u64_hex(cr4_after);
+        serial::write_byte(b'\n');
+    }
 }

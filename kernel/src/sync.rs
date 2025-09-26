@@ -1,10 +1,10 @@
 use core::cell::UnsafeCell;
 use core::ops::{Deref, DerefMut};
-use core::sync::atomic::{AtomicBool, Ordering};
 
-/// A simple spin lock for use inside the microkernel.
+use crate::arch;
+
+/// A simple lock that guards data by disabling interrupts on the current core.
 pub struct SpinLock<T> {
-    locked: AtomicBool,
     value: UnsafeCell<T>,
 }
 
@@ -12,36 +12,38 @@ unsafe impl<T: Send> Sync for SpinLock<T> {}
 unsafe impl<T: Send> Send for SpinLock<T> {}
 
 impl<T> SpinLock<T> {
-    /// Creates a new spin lock around the provided value.
+    /// Creates a new lock around the provided value.
     pub const fn new(value: T) -> Self {
         Self {
-            locked: AtomicBool::new(false),
             value: UnsafeCell::new(value),
         }
     }
 
-    /// Acquires the lock, spinning until it becomes available.
+    /// Acquires the lock by disabling interrupts until the guard is dropped.
     pub fn lock(&self) -> SpinLockGuard<'_, T> {
-        while self
-            .locked
-            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            core::hint::spin_loop();
+        let interrupts_were_enabled = arch::interrupts_enabled();
+        if interrupts_were_enabled {
+            arch::disable_interrupts();
         }
 
-        SpinLockGuard { lock: self }
+        SpinLockGuard {
+            lock: self,
+            interrupts_were_enabled,
+        }
     }
 }
 
 /// Guard returned by [`SpinLock::lock`].
 pub struct SpinLockGuard<'a, T> {
     lock: &'a SpinLock<T>,
+    interrupts_were_enabled: bool,
 }
 
 impl<'a, T> Drop for SpinLockGuard<'a, T> {
     fn drop(&mut self) {
-        self.lock.locked.store(false, Ordering::Release);
+        if self.interrupts_were_enabled {
+            arch::enable_interrupts();
+        }
     }
 }
 
