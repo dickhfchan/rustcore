@@ -33,6 +33,7 @@ pub trait Index {
 pub trait MutableIndex: Index {
     fn insert(&mut self, bucket: &str, key: &str, meta: ObjectMetadata);
     fn remove(&mut self, bucket: &str, key: &str);
+    fn purge_bucket(&mut self, bucket: &str);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -156,6 +157,11 @@ impl MutableIndex for InMemoryIndex {
             entries.retain(|k| k != key);
         }
         self.metadata.remove(&(bucket.to_owned(), key.to_owned()));
+    }
+
+    fn purge_bucket(&mut self, bucket: &str) {
+        self.buckets.remove(bucket);
+        self.metadata.retain(|(b, _), _| b != bucket);
     }
 }
 

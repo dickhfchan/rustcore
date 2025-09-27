@@ -23,6 +23,10 @@ impl EventLog {
         self.entries.push(event.as_ref().to_string());
     }
 
+    pub fn snapshot(&self) -> Vec<String> {
+        self.entries.clone()
+    }
+
     #[cfg(test)]
     pub fn entries(&self) -> &[String] {
         &self.entries

@@ -186,6 +186,16 @@ where
         };
         Self::response(403, body)
     }
+
+    fn handle_logs(&self) -> Response {
+        let snapshot = self.events.snapshot();
+        let mut body = String::new();
+        for entry in snapshot {
+            body.push_str(&entry);
+            body.push('\n');
+        }
+        Self::response(200, body.into_bytes())
+    }
 }
 
 impl<C, O, S, I> HttpHandler for S3Service<C, O, S, I>
@@ -207,6 +217,20 @@ where
             None => (trimmed, None),
         };
 
+        if path == "_logs" {
+            return match request.method {
+                Method::Get => self.handle_logs(),
+                _ => Self::response(405, b"MethodNotAllowed".to_vec()),
+            };
+        }
+
+        if path.is_empty() {
+            return match request.method {
+                Method::Get => self.handle_list_buckets(),
+                _ => Self::response(405, b"MethodNotAllowed".to_vec()),
+            };
+        }
+
         let mut parts = path.splitn(2, '/');
         let bucket = match parts.next() {
             Some(name) if !name.is_empty() => name,
@@ -215,12 +239,58 @@ where
         let key = parts.next().unwrap_or("");
 
         match request.method {
+            Method::Put if key.is_empty() => self.handle_create_bucket(bucket),
             Method::Put => self.handle_put(bucket, key, &request.body),
             Method::Get if key.is_empty() => self.handle_list(bucket, query),
             Method::Get => self.handle_get(bucket, key),
+            Method::Delete if key.is_empty() => self.handle_delete_bucket(bucket),
             Method::Delete => self.handle_delete(bucket, key),
             _ => Self::response(405, b"MethodNotAllowed".to_vec()),
         }
+    }
+}
+impl<C, O, S, I> S3Service<C, O, S, I>
+where
+    C: Catalog,
+    O: ObjectStore,
+    S: KeyStore,
+    I: MutableIndex,
+{
+    fn handle_create_bucket(&mut self, bucket: &str) -> Response {
+        match self.catalog.create_bucket(bucket) {
+            Ok(()) => {
+                self.events.record(format!("CREATE_BUCKET {}", bucket));
+                Self::empty_response(200)
+            }
+            Err(CatalogError::AlreadyExists) => {
+                Self::response(409, b"BucketAlreadyExists".to_vec())
+            }
+            Err(CatalogError::InvalidName) => Self::response(400, b"InvalidBucketName".to_vec()),
+            Err(_) => Self::response(500, b"CatalogError".to_vec()),
+        }
+    }
+
+    fn handle_delete_bucket(&mut self, bucket: &str) -> Response {
+        match self.catalog.delete_bucket(bucket) {
+            Ok(()) => {
+                self.index.purge_bucket(bucket);
+                self.events.record(format!("DELETE_BUCKET {}", bucket));
+                Self::empty_response(204)
+            }
+            Err(CatalogError::NotFound) => Self::response(404, b"NoSuchBucket".to_vec()),
+            Err(_) => Self::response(500, b"CatalogError".to_vec()),
+        }
+    }
+
+    fn handle_list_buckets(&mut self) -> Response {
+        let mut body = String::new();
+        body.push_str("Buckets:\n");
+        self.catalog.list_buckets(&mut |info| {
+            body.push_str(info.name);
+            body.push_str("\n");
+        });
+        self.events.record("LIST_BUCKETS");
+        Self::response(200, body.into_bytes())
     }
 }
 
@@ -422,5 +492,48 @@ mod tests {
             b"data",
         ));
         assert_eq!(resp.status, 400);
+    }
+
+    #[test]
+    fn logs_endpoint_returns_events() {
+        let mut service = new_service();
+        service.handle(&make_request(
+            Method::Put,
+            "/photos/log.txt",
+            Some("abc123"),
+            b"log",
+        ));
+        let resp = service.handle(&make_request(Method::Get, "/_logs", Some("abc123"), &[]));
+        assert_eq!(resp.status, 200);
+        let body = core::str::from_utf8(&resp.body).unwrap();
+        assert!(body.contains("PUT photos/log.txt"));
+    }
+
+    #[test]
+    fn create_and_list_bucket() {
+        let mut service = new_empty_service();
+        let create = service.handle(&make_request(Method::Put, "/photos", Some("abc123"), &[]));
+        assert_eq!(create.status, 200);
+
+        let list = service.handle(&make_request(Method::Get, "/", Some("abc123"), &[]));
+        assert_eq!(list.status, 200);
+        let body = core::str::from_utf8(&list.body).unwrap();
+        assert!(body.contains("photos"));
+    }
+
+    #[test]
+    fn delete_bucket_removes_entries() {
+        let mut service = new_empty_service();
+        service.handle(&make_request(Method::Put, "/archive", Some("abc123"), &[]));
+        let delete = service.handle(&make_request(
+            Method::Delete,
+            "/archive",
+            Some("abc123"),
+            &[],
+        ));
+        assert_eq!(delete.status, 204);
+        let list = service.handle(&make_request(Method::Get, "/", Some("abc123"), &[]));
+        let body = core::str::from_utf8(&list.body).unwrap();
+        assert!(!body.contains("archive"));
     }
 }
