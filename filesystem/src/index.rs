@@ -1,7 +1,8 @@
 #![allow(dead_code)]
 
+use alloc::borrow::ToOwned;
 use alloc::collections::BTreeMap;
-use alloc::string::String;
+use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 use storage::object::ObjectMetadata;

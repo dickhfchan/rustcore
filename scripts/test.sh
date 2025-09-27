@@ -47,8 +47,10 @@ TEST TYPES:
     boot                Basic boot sequence tests
     smoke               Boot smoke tests
     enhanced            Enhanced functionality tests
-    services            Service integration tests
+    functional          Comprehensive functional tests (IPC, memory, timer, scheduler)
     memory              Memory management tests
+    ipc                 IPC communication tests
+    services            Service integration tests
     interrupts          Interrupt handling tests
     build               Build system tests
     ci                  CI/CD integration tests
@@ -345,6 +347,90 @@ run_enhanced_tests() {
     return $failed
 }
 
+# Function to run comprehensive functional tests
+run_functional_tests() {
+    log "INFO" "Running comprehensive functional tests..."
+    
+    local functional_binary
+    functional_binary=$(find_test_binary "direct_functional_test")
+    
+    if [ $? -ne 0 ]; then
+        log "ERROR" "Direct functional test binary not found"
+        return 1
+    fi
+    
+    local passed=0
+    local failed=0
+    
+    # Direct functional test (runs tests immediately without scheduler)
+    if run_test "Direct Functional Test" \
+        "./scripts/run-qemu.sh $functional_binary" \
+        "DIRECT_FUNC: All functional tests PASSED!,DIRECT_FUNC: tests_passed,DIRECT_FUNC: tests_failed"; then
+        passed=$((passed + 1))
+    else
+        failed=$((failed + 1))
+    fi
+    
+    log "INFO" "Functional tests completed: $passed passed, $failed failed"
+    return $failed
+}
+
+# Function to run memory management tests
+run_memory_tests() {
+    log "INFO" "Running memory management tests..."
+    
+    local memory_binary
+    memory_binary=$(find_test_binary "memory_test")
+    
+    if [ $? -ne 0 ]; then
+        log "ERROR" "Memory test binary not found"
+        return 1
+    fi
+    
+    local passed=0
+    local failed=0
+    
+    # Memory management test
+    if run_test "Memory Management Test" \
+        "./scripts/run-qemu.sh $memory_binary" \
+        "MEMORY: All memory tests PASSED!,MEMORY: tests_passed,MEMORY: tests_failed"; then
+        passed=$((passed + 1))
+    else
+        failed=$((failed + 1))
+    fi
+    
+    log "INFO" "Memory tests completed: $passed passed, $failed failed"
+    return $failed
+}
+
+# Function to run IPC communication tests
+run_ipc_tests() {
+    log "INFO" "Running IPC communication tests..."
+    
+    local ipc_binary
+    ipc_binary=$(find_test_binary "ipc_test")
+    
+    if [ $? -ne 0 ]; then
+        log "ERROR" "IPC test binary not found"
+        return 1
+    fi
+    
+    local passed=0
+    local failed=0
+    
+    # IPC communication test
+    if run_test "IPC Communication Test" \
+        "./scripts/run-qemu.sh $ipc_binary" \
+        "IPC: All IPC tests PASSED!,IPC: tests_passed,IPC: tests_failed"; then
+        passed=$((passed + 1))
+    else
+        failed=$((failed + 1))
+    fi
+    
+    log "INFO" "IPC tests completed: $passed passed, $failed failed"
+    return $failed
+}
+
 # Function to run service tests
 run_service_tests() {
     log "INFO" "Running service integration tests..."
@@ -438,6 +524,9 @@ run_all_tests() {
     
     if [ "$QUICK" = false ]; then
         run_enhanced_tests || total_failed=$((total_failed + 1))
+        run_functional_tests || total_failed=$((total_failed + 1))
+        run_memory_tests || total_failed=$((total_failed + 1))
+        run_ipc_tests || total_failed=$((total_failed + 1))
     fi
     
     run_service_tests || total_failed=$((total_failed + 1))
@@ -493,7 +582,7 @@ main() {
                 skip_build=true
                 shift
                 ;;
-            all|boot|smoke|enhanced|services|memory|interrupts|build|ci|benchmark)
+            all|boot|smoke|enhanced|functional|memory|ipc|services|interrupts|build|ci|benchmark)
                 test_type="$1"
                 shift
                 ;;
@@ -541,6 +630,15 @@ main() {
             ;;
         "enhanced")
             run_enhanced_tests || exit_code=1
+            ;;
+        "functional")
+            run_functional_tests || exit_code=1
+            ;;
+        "memory")
+            run_memory_tests || exit_code=1
+            ;;
+        "ipc")
+            run_ipc_tests || exit_code=1
             ;;
         "services")
             run_service_tests || exit_code=1

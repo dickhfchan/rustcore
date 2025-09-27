@@ -39,9 +39,9 @@ fn log_line(message: &str) {
 
 fn enhanced_init_task() {
     let channel = kernel::ipc_bridge::kernel_channel();
-    
+
     log_line("ENHANCED: Starting enhanced init task");
-    
+
     // Validate boot info
     if let Some(boot_info) = kernel::boot::boot_info() {
         log_line("ENHANCED: Boot info available");
@@ -50,16 +50,16 @@ fn enhanced_init_task() {
     } else {
         log_line("ENHANCED: No boot info available");
     }
-    
+
     // Test timer functionality
     log_line("ENHANCED: Checking timer ticks");
     let initial_ticks = arch::timer_ticks();
     log_line("ENHANCED: Initial timer ticks");
     log_line_hex("  ticks=", initial_ticks);
-    
+
     // Run the bootstrap
     let outcome = services_init::bootstrap(channel, kernel::boot::boot_info());
-    
+
     // Validate bootstrap outcome
     log_line("ENHANCED: Bootstrap completed");
     if outcome.receive_error.is_none() {
@@ -69,7 +69,7 @@ fn enhanced_init_task() {
     } else {
         log_line("ENHANCED: Bootstrap failed");
     }
-    
+
     // Test manifest validation
     log_line("ENHANCED: Manifest validation");
     if outcome.manifest.error.is_none() {
@@ -79,13 +79,13 @@ fn enhanced_init_task() {
     } else {
         log_line("ENHANCED: Manifest invalid");
     }
-    
+
     let payload: &[u8] = if outcome.receive_error.is_none() {
         b"INIT:ENHANCED:READY"
     } else {
         b"INIT:ENHANCED:FAIL"
     };
-    
+
     let _ = channel.send(payload);
     log_line("ENHANCED: Enhanced init task complete");
 }
