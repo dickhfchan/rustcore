@@ -1,34 +1,30 @@
 #![allow(dead_code)]
 
 use crate::ethernet::NetError;
-use crate::ip::Ipv4Addr;
+use crate::ip::{Ipv4Addr, LoopbackIp};
 
 pub struct TcpEndpoint {
     pub local: (Ipv4Addr, u16),
     pub remote: (Ipv4Addr, u16),
 }
 
-pub trait TcpStack {
-    fn connect(&mut self, remote: (Ipv4Addr, u16)) -> Result<TcpHandle, NetError>;
-    fn listen(&mut self, local_port: u16) -> Result<TcpListener, NetError>;
+pub struct TcpHandle<'a, D: crate::ethernet::EthernetDriver> {
+    ip: &'a mut LoopbackIp<D>,
+    remote: (Ipv4Addr, u16),
 }
 
-pub struct TcpHandle;
-
-impl TcpHandle {
-    pub fn send(&mut self, _bytes: &[u8]) -> Result<(), NetError> {
-        Ok(())
+impl<'a, D: crate::ethernet::EthernetDriver> TcpHandle<'a, D> {
+    pub fn send(&mut self, bytes: &[u8]) -> Result<(), NetError> {
+        self.ip.send(bytes)
     }
 
-    pub fn recv(&mut self, _buffer: &mut [u8]) -> Result<usize, NetError> {
-        Ok(0)
+    pub fn recv(&mut self, buffer: &mut [u8]) -> Result<usize, NetError> {
+        self.ip.receive(buffer)
     }
 }
 
-pub struct TcpListener;
-
-impl TcpListener {
-    pub fn accept(&mut self) -> Result<TcpHandle, NetError> {
-        Err(NetError::Unsupported)
+impl<'a, D: crate::ethernet::EthernetDriver> TcpHandle<'a, D> {
+    pub fn new(ip: &'a mut LoopbackIp<D>, remote: (Ipv4Addr, u16)) -> Self {
+        Self { ip, remote }
     }
 }

@@ -3,12 +3,12 @@
 use crate::ethernet::NetError;
 use crate::tcp::TcpHandle;
 
-pub struct TlsSession {
-    handle: TcpHandle,
+pub struct TlsSession<'a, D: crate::ethernet::EthernetDriver> {
+    handle: TcpHandle<'a, D>,
 }
 
-impl TlsSession {
-    pub fn new(handle: TcpHandle) -> Self {
+impl<'a, D: crate::ethernet::EthernetDriver> TlsSession<'a, D> {
+    pub fn new(handle: TcpHandle<'a, D>) -> Self {
         Self { handle }
     }
 
