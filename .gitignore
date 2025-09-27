@@ -1,0 +1,55 @@
+# Rust build artifacts
+/target/
+**/*.rlib
+**/*.rmeta
+**/*.rlib.d
+**/*.rmeta.d
+
+# Cargo
+Cargo.lock
+
+# Debug logs
+*.log
+debug-*.log
+full_*.log
+qemu.log
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.temp
+.tmp/
+
+# Backup files
+*.bak
+*.backup
+
+# Compiled binaries (for custom targets)
+kernel
+init
+boot_smoke
+enhanced_kernel
+functional_test
+memory_test
+ipc_test
+functional_demo
+direct_functional_test
+simple_test
+
+# QEMU output files
+qemu-*.log
