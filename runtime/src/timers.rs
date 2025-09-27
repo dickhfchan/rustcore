@@ -59,7 +59,7 @@ impl TimerService for TimerQueue {
 
 #[cfg(test)]
 mod tests {
-    use super::{TimerQueue, TimerService, TimerId};
+    use super::{TimerId, TimerQueue, TimerService};
 
     #[test]
     fn schedule_and_poll() {

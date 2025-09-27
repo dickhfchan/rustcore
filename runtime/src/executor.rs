@@ -44,8 +44,8 @@ impl Executor for SimpleExecutor {
 #[cfg(test)]
 mod tests {
     use super::{SimpleExecutor, Task};
-    use core::sync::atomic::{AtomicUsize, Ordering};
     use core::cell::UnsafeCell;
+    use core::sync::atomic::{AtomicUsize, Ordering};
 
     static LOG_SIZE: usize = 4;
     static INVOCATIONS: InvocationLog = InvocationLog::new();

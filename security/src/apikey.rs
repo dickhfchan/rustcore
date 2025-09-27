@@ -28,3 +28,35 @@ impl<'a, S: KeyStore> ApiKeyValidator for StaticApiKeyValidator<'a, S> {
         self.store.lookup(key).map_err(AuthError::Store)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::keystore::{InMemoryKeyStore, KeyStore};
+
+    #[test]
+    fn validates_existing_key() {
+        let mut store = InMemoryKeyStore::new();
+        store
+            .insert(ApiKeyEntry {
+                key_id: "key1",
+                hash: [0xAB; 32],
+                bucket: "photos",
+                permissions: 0x1,
+            })
+            .unwrap();
+        let validator = StaticApiKeyValidator::new(&store);
+        let entry = validator.validate("key1").unwrap();
+        assert_eq!(entry.bucket, "photos");
+    }
+
+    #[test]
+    fn missing_key_returns_error() {
+        let store = InMemoryKeyStore::new();
+        let validator = StaticApiKeyValidator::new(&store);
+        assert!(matches!(
+            validator.validate("missing"),
+            Err(AuthError::Store(KeyStoreError::NotFound))
+        ));
+    }
+}
