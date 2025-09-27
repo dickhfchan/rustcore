@@ -1,0 +1,7 @@
+[kernel]
+welcome_banner = "Rustcore boot sequence"
+broker_endpoint = "ipc://bootstrap"
+
+[init]
+expected_boot_message = "BOOT"
+ack_payload = "INIT:READY"

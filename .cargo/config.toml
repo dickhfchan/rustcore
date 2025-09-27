@@ -10,5 +10,5 @@ rustflags = [
   "-Clink-arg=-Ttargets/x86_64-rustcore.ld",
   "-Crelocation-model=static",
   "-Ccode-model=kernel",
-  "-Cpanic=abort",
 ]
+runner = ["scripts/run-qemu.sh"]

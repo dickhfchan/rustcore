@@ -5,6 +5,7 @@ version = "0.1.0"
 authors = ["Rustcore Contributors"]
 
 [dependencies]
+bootproto = { path = "../bootproto" }
 ipc = { path = "../ipc" }
 services-init = { package = "init", path = "../services/init" }
 

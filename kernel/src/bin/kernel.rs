@@ -1,12 +1,13 @@
 #![no_std]
 #![no_main]
 
+use bootproto::BootInfo;
 use core::panic::PanicInfo;
 
 use kernel::arch;
 
 #[cfg(target_arch = "x86_64")]
-core::arch::global_asm!(include_str!("../arch/x86_64/boot.S"));
+core::arch::global_asm!(include_str!("../arch/x86_64/boot.S"), options(att_syntax));
 
 core::arch::global_asm!(
     ".section .note.xen.pvh,\"a\",@note",
@@ -22,6 +23,7 @@ core::arch::global_asm!(
     ".long _start",
     "6:",
     ".align 4",
+    options(att_syntax)
 );
 
 fn log_line(message: &str) {
@@ -38,7 +40,7 @@ fn log_line(message: &str) {
 fn init_task() {
     let channel = kernel::ipc_bridge::kernel_channel();
 
-    let outcome = services_init::bootstrap(channel);
+    let outcome = services_init::bootstrap(channel, kernel::boot::boot_info());
     let payload: &[u8] = if outcome.receive_error.is_none() {
         b"INIT:READY"
     } else {
@@ -49,21 +51,40 @@ fn init_task() {
 }
 
 #[no_mangle]
-pub extern "C" fn kernel_main() -> ! {
+pub extern "C" fn rustcore_entry(boot_info_ptr: *const BootInfo) -> ! {
+    let boot_info_ref: &'static BootInfo = unsafe {
+        if boot_info_ptr.is_null() {
+            &*core::ptr::addr_of!(kernel::boot::RUSTCORE_BOOTINFO)
+        } else {
+            &*boot_info_ptr
+        }
+    };
+
+    kernel::init(Some(boot_info_ref));
     log_line("kernel: entered kernel_main");
-    kernel::init();
 
     kernel::ipc_bridge::register_init_service();
     let _ = kernel::scheduler::register(init_task);
     let _ = kernel::ipc_bridge::send_bootstrap_message(b"BOOT");
 
     kernel::scheduler::run();
-    kernel::arch::unmask_timer_irq();
+    arch::start_timer(100);
 
     let mut ack = [0u8; 16];
     let _ = kernel::ipc_bridge::receive_bootstrap_message(&mut ack);
+    log_line("kernel: init ack received");
 
-    while kernel::arch::timer_ticks() < 5 {
+    let mut spin = 0u64;
+    loop {
+        let ticks = kernel::arch::timer_ticks();
+        if ticks >= 5 {
+            log_line_hex("ticks", ticks);
+            break;
+        }
+        spin = spin.wrapping_add(1);
+        if spin % 1_000_000 == 0 {
+            log_line_hex("ticks", ticks);
+        }
         core::hint::spin_loop();
     }
 
@@ -81,25 +102,22 @@ pub extern "C" fn kernel_main() -> ! {
     arch::halt()
 }
 
+#[no_mangle]
+pub extern "C" fn rustcore_entry64(boot_info_ptr: *const BootInfo) -> ! {
+    rustcore_entry(boot_info_ptr)
+}
+
 fn log_line_hex(prefix: &str, value: u64) {
     let was_enabled = arch::interrupts_enabled();
     if was_enabled {
         arch::disable_interrupts();
     }
-    let mut buf = [0u8; 18];
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut idx = 0;
-    while idx < 16 {
-        let shift = (15 - idx) * 4;
-        buf[2 + idx] = HEX[((value >> shift) & 0xF) as usize];
-        idx += 1;
-    }
-    buf[0] = b'0';
-    buf[1] = b'x';
-    buf[17] = b'\n';
     arch::serial_write_bytes(prefix.as_bytes());
     arch::serial_write_byte(b' ');
-    arch::serial_write_bytes(&buf[..18]);
+    arch::serial_write_byte(b'0');
+    arch::serial_write_byte(b'x');
+    arch::serial_write_u64_hex(value);
+    arch::serial_write_byte(b'\n');
     if was_enabled {
         arch::enable_interrupts();
     }

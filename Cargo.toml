@@ -1,6 +1,13 @@
 [workspace]
 members = [
+    "bootproto",
     "kernel",
+    "storage",
+    "filesystem",
+    "netstack",
+    "runtime",
+    "security",
+    "services/s3",
     "ipc",
     "services/init",
 ]
@@ -12,9 +19,3 @@ edition = "2021"
 version = "0.1.0"
 license = "MIT OR Apache-2.0"
 authors = ["Rustcore Contributors"]
-
-[profile.dev]
-panic = "abort"
-
-[profile.release]
-panic = "abort"

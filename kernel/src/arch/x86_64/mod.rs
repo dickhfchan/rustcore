@@ -7,17 +7,16 @@ pub fn init() {
     unsafe {
         serial::init();
         serial::write_bytes(b"arch: serial ready\n");
-        pic::init();
-        serial::write_bytes(b"arch: pic init\n");
         paging::init();
         serial::write_bytes(b"arch: paging init\n");
         descriptor::init();
         serial::write_bytes(b"arch: descriptor init\n");
         interrupts::init();
         serial::write_bytes(b"arch: idt init\n");
-        pit::start_periodic(100); // 100 Hz tick for scheduler bookkeeping
-        serial::write_bytes(b"arch: pit started\n");
     }
+
+    lapic::init(InterruptVector::Spurious as u8);
+    serial::write_bytes(b"arch: lapic init\n");
 
     enable_simd();
 }
@@ -59,6 +58,38 @@ pub fn halt() -> ! {
             // SAFETY: `hlt` is valid once interrupts are configured.
             asm!("hlt", options(nomem, nostack));
         }
+    }
+}
+
+/// Utilities for coordinating with QEMU during automated test runs.
+#[cfg_attr(not(test), allow(dead_code))]
+pub mod qemu {
+    use core::arch::asm;
+
+    const ISA_DEBUG_EXIT_PORT: u16 = 0xf4;
+
+    /// Signals a successful run to QEMU and terminates the emulator.
+    pub fn exit_success() -> ! {
+        exit(0)
+    }
+
+    /// Signals a failure to QEMU and terminates the emulator.
+    pub fn exit_failure() -> ! {
+        exit(1)
+    }
+
+    fn exit(code: u32) -> ! {
+        unsafe {
+            // SAFETY: Writing to the ISA debug exit port requests QEMU shutdown.
+            asm!(
+                "out dx, eax",
+                in("dx") ISA_DEBUG_EXIT_PORT,
+                in("eax") (code << 1) | 1,
+                options(nomem, nostack, preserves_flags)
+            );
+        }
+
+        super::halt()
     }
 }
 
@@ -174,12 +205,12 @@ mod descriptor {
 }
 
 mod interrupts {
-    use core::{arch::asm, cell::UnsafeCell, mem::size_of, ptr};
     use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+    use core::{arch::asm, cell::UnsafeCell, mem::size_of, ptr};
 
     use core::num::NonZeroUsize;
 
-    use super::{descriptor::KERNEL_CODE_SELECTOR, pic, serial};
+    use super::{descriptor::KERNEL_CODE_SELECTOR, lapic, serial};
 
     #[repr(C, packed)]
     struct DescriptorTablePointer {
@@ -257,7 +288,12 @@ mod interrupts {
             self.entries[vector as usize] = IdtEntry::with_handler(handler, dpl);
         }
 
-        fn set_handler_err(&mut self, vector: InterruptVector, handler: HandlerFuncWithErr, dpl: u16) {
+        fn set_handler_err(
+            &mut self,
+            vector: InterruptVector,
+            handler: HandlerFuncWithErr,
+            dpl: u16,
+        ) {
             self.entries[vector as usize] = IdtEntry::with_handler_err(handler, dpl);
         }
     }
@@ -288,8 +324,7 @@ mod interrupts {
     pub enum InterruptVector {
         GeneralProtection = 13,
         Timer = 32,
-        PrimarySpurious = 0x27,
-        SecondarySpurious = 0x2F,
+        Spurious = 0xFF,
         Ipc = 0x80,
     }
 
@@ -297,9 +332,12 @@ mod interrupts {
     pub(super) unsafe fn init() {
         IDT.set_handler(InterruptVector::Timer, timer_trap, 0);
         IDT.set_handler(InterruptVector::Ipc, ipc_trap, 3);
-        IDT.set_handler_err(InterruptVector::GeneralProtection, general_protection_fault, 0);
-        IDT.set_handler(InterruptVector::PrimarySpurious, spurious_trap, 0);
-        IDT.set_handler(InterruptVector::SecondarySpurious, spurious_trap, 0);
+        IDT.set_handler_err(
+            InterruptVector::GeneralProtection,
+            general_protection_fault,
+            0,
+        );
+        IDT.set_handler(InterruptVector::Spurious, spurious_trap, 0);
 
         let descriptor = DescriptorTablePointer {
             limit: (size_of::<Idt>() - 1) as u16,
@@ -356,10 +394,7 @@ mod interrupts {
         serial::write_u64_hex(error_code);
         serial::write_byte(b'\n');
 
-        // Skip the faulting instruction so we can continue execution and surface the context.
-        frame.instruction_pointer = frame.instruction_pointer.wrapping_add(5);
-
-        super::enable_interrupts();
+        super::halt()
     }
 
     pub fn take_last_gp_fault() -> Option<(u64, u64, u64)> {
@@ -375,16 +410,15 @@ mod interrupts {
     }
 
     extern "x86-interrupt" fn spurious_trap(_frame: &mut InterruptStackFrame) {
-        pic::end_of_interrupt(0);
+        lapic::end_of_interrupt();
     }
 
     fn acknowledge(vector: InterruptVector) {
         match vector {
-            InterruptVector::Timer => pic::end_of_interrupt(0),
-            InterruptVector::Ipc => {},
-            InterruptVector::GeneralProtection => {},
-            InterruptVector::PrimarySpurious => {},
-            InterruptVector::SecondarySpurious => {},
+            InterruptVector::Timer => lapic::end_of_interrupt(),
+            InterruptVector::Ipc => {}
+            InterruptVector::GeneralProtection => {}
+            InterruptVector::Spurious => lapic::end_of_interrupt(),
         }
     }
 
@@ -413,7 +447,8 @@ mod interrupts {
     }
 
     fn load_callback(slot: &AtomicUsize) -> Option<fn()> {
-        NonZeroUsize::new(slot.load(Ordering::SeqCst)).map(|nz| unsafe { core::mem::transmute(nz.get()) })
+        NonZeroUsize::new(slot.load(Ordering::SeqCst))
+            .map(|nz| unsafe { core::mem::transmute(nz.get()) })
     }
 }
 
@@ -477,8 +512,79 @@ mod io {
     }
 
     #[inline]
+    #[allow(dead_code)]
     pub unsafe fn io_wait() {
         asm!("out 0x80, al", in("al") 0_u8, options(nomem, nostack, preserves_flags));
+    }
+}
+
+mod lapic {
+    use core::arch::asm;
+
+    const MSR_APIC_BASE: u32 = 0x1B;
+    const MSR_X2APIC_TPR: u32 = 0x808;
+    const MSR_X2APIC_EOI: u32 = 0x80B;
+    const MSR_X2APIC_SVR: u32 = 0x80F;
+    const MSR_X2APIC_LVT_TIMER: u32 = 0x832;
+    const MSR_X2APIC_INITIAL_COUNT: u32 = 0x838;
+    const MSR_X2APIC_DIVIDE: u32 = 0x83E;
+
+    const SVR_ENABLE: u64 = 1 << 8;
+    const APIC_ENABLE: u64 = 1 << 8;
+    const X2APIC_ENABLE: u64 = 1 << 11;
+
+    const TIMER_PERIODIC: u64 = 1 << 17;
+    const DEFAULT_BUS_HZ: u64 = 25_000_000;
+
+    pub fn init(spurious_vector: u8) {
+        unsafe {
+            let mut base = read_msr(MSR_APIC_BASE);
+            base |= APIC_ENABLE | X2APIC_ENABLE;
+            write_msr(MSR_APIC_BASE, base);
+
+            write_msr(MSR_X2APIC_TPR, 0);
+            write_msr(MSR_X2APIC_SVR, SVR_ENABLE | spurious_vector as u64);
+            write_msr(MSR_X2APIC_LVT_TIMER, (1 << 16) | spurious_vector as u64);
+        }
+    }
+
+    pub fn start_timer(vector: u8, hz: u32) {
+        if hz == 0 {
+            return;
+        }
+        unsafe {
+            write_msr(MSR_X2APIC_DIVIDE, 0b1011); // divide by 1
+            write_msr(MSR_X2APIC_LVT_TIMER, TIMER_PERIODIC | vector as u64);
+            write_msr(MSR_X2APIC_INITIAL_COUNT, compute_initial_count(hz));
+        }
+    }
+
+    pub fn end_of_interrupt() {
+        unsafe {
+            write_msr(MSR_X2APIC_EOI, 0);
+        }
+    }
+
+    fn compute_initial_count(hz: u32) -> u64 {
+        let hz = hz.max(1) as u64;
+        let mut count = DEFAULT_BUS_HZ / hz;
+        if count == 0 {
+            count = 1;
+        }
+        count
+    }
+
+    unsafe fn read_msr(msr: u32) -> u64 {
+        let low: u32;
+        let high: u32;
+        asm!("rdmsr", in("ecx") msr, out("eax") low, out("edx") high, options(nomem, preserves_flags));
+        ((high as u64) << 32) | low as u64
+    }
+
+    unsafe fn write_msr(msr: u32, value: u64) {
+        let low = value as u32;
+        let high = (value >> 32) as u32;
+        asm!("wrmsr", in("ecx") msr, in("eax") low, in("edx") high, options(nomem, preserves_flags));
     }
 }
 
@@ -524,123 +630,12 @@ mod serial {
     }
 }
 
-mod pic {
-    use super::io;
-
-    const PIC1_CMD: u16 = 0x20;
-    const PIC1_DATA: u16 = 0x21;
-    const PIC2_CMD: u16 = 0xA0;
-    const PIC2_DATA: u16 = 0xA1;
-
-    const ICW1_INIT: u8 = 0x10;
-    const ICW1_ICW4: u8 = 0x01;
-    const ICW4_8086: u8 = 0x01;
-    const PIC1_OFFSET: u8 = 0x20;
-    const PIC2_OFFSET: u8 = 0x28;
-    const PIC_EOI: u8 = 0x20;
-
-    #[allow(static_mut_refs)]
-    pub(super) unsafe fn init() {
-        // Start initialization sequence.
-        io::out_u8(PIC1_CMD, ICW1_INIT | ICW1_ICW4);
-        io::io_wait();
-        io::out_u8(PIC2_CMD, ICW1_INIT | ICW1_ICW4);
-        io::io_wait();
-
-        // Remap vector offsets.
-        io::out_u8(PIC1_DATA, PIC1_OFFSET);
-        io::io_wait();
-        io::out_u8(PIC2_DATA, PIC2_OFFSET);
-        io::io_wait();
-
-        // Tell Master PIC about the slave at IRQ2, and vice versa.
-        io::out_u8(PIC1_DATA, 0x04);
-        io::io_wait();
-        io::out_u8(PIC2_DATA, 0x02);
-        io::io_wait();
-
-        // Set environment info.
-        io::out_u8(PIC1_DATA, ICW4_8086);
-        io::io_wait();
-        io::out_u8(PIC2_DATA, ICW4_8086);
-        io::io_wait();
-
-        // Mask all IRQ lines initially.
-        io::out_u8(PIC1_DATA, 0xFF);
-        io::out_u8(PIC2_DATA, 0xFF);
-    }
-
-    pub(super) fn end_of_interrupt(irq: u8) {
-        unsafe {
-            if irq >= 8 {
-                io::out_u8(PIC2_CMD, PIC_EOI);
-            }
-            io::out_u8(PIC1_CMD, PIC_EOI);
-        }
-    }
-
-    pub(super) fn unmask_irq(irq: u8) {
-        unsafe {
-            if irq < 8 {
-                let mut mask = io::in_u8(PIC1_DATA);
-                mask &= !(1 << irq);
-                io::out_u8(PIC1_DATA, mask);
-            } else {
-                let mut mask = io::in_u8(PIC2_DATA);
-                mask &= !(1 << (irq - 8));
-                io::out_u8(PIC2_DATA, mask);
-            }
-        }
-    }
-
-    #[allow(dead_code)]
-    pub(super) fn mask_irq(irq: u8) {
-        unsafe {
-            if irq < 8 {
-                let mut mask = io::in_u8(PIC1_DATA);
-                mask |= 1 << irq;
-                io::out_u8(PIC1_DATA, mask);
-            } else {
-                let mut mask = io::in_u8(PIC2_DATA);
-                mask |= 1 << (irq - 8);
-                io::out_u8(PIC2_DATA, mask);
-            }
-        }
-    }
-}
-
-mod pit {
-    use super::io;
-
-    const PIT_FREQUENCY_HZ: u64 = 1_193_182;
-    const PIT_CHANNEL0: u16 = 0x40;
-    const PIT_COMMAND: u16 = 0x43;
-
-    pub(super) unsafe fn start_periodic(hz: u32) {
-        let hz = hz.clamp(19, 1000); // keep divisor within 16-bit range and reasonable tick
-        let divisor = (PIT_FREQUENCY_HZ / hz as u64) as u16;
-
-        program_counter(divisor);
-    }
-
-    unsafe fn program_counter(divisor: u16) {
-        // Channel 0, access low/high, mode 3 (square wave).
-        io::out_u8(PIT_COMMAND, 0x36);
-        io::out_u8(PIT_CHANNEL0, (divisor & 0xFF) as u8);
-        io::out_u8(PIT_CHANNEL0, (divisor >> 8) as u8);
-    }
-}
-
 pub use interrupts::{
     register_ipc_handler, register_timer_handler, timer_ticks, InterruptStackFrame, InterruptVector,
 };
 
 pub fn take_last_gp_fault() -> Option<(u64, u64, u64)> {
     interrupts::take_last_gp_fault()
-}
-
-pub fn unmask_timer_irq() {
-    pic::unmask_irq(0)
 }
 
 pub fn serial_write_line(message: &str) {
@@ -654,6 +649,29 @@ pub fn serial_write_bytes(bytes: &[u8]) {
 
 pub fn serial_write_byte(byte: u8) {
     serial::write_byte(byte);
+}
+
+pub fn serial_write_u64_hex(value: u64) {
+    serial::write_u64_hex(value);
+}
+
+pub fn start_timer(hz: u32) {
+    lapic::start_timer(InterruptVector::Timer as u8, hz);
+    serial::write_bytes(b"arch: lapic timer armed\n");
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn memcmp(a: *const u8, b: *const u8, len: usize) -> i32 {
+    let mut idx = 0;
+    while idx < len {
+        let lhs = *a.add(idx);
+        let rhs = *b.add(idx);
+        if lhs != rhs {
+            return lhs as i32 - rhs as i32;
+        }
+        idx += 1;
+    }
+    0
 }
 
 fn enable_simd() {

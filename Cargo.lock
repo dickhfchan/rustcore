@@ -3,9 +3,21 @@
 version = 4
 
 [[package]]
+name = "bootproto"
+version = "0.1.0"
+
+[[package]]
+name = "filesystem"
+version = "0.1.0"
+dependencies = [
+ "storage",
+]
+
+[[package]]
 name = "init"
 version = "0.1.0"
 dependencies = [
+ "bootproto",
  "ipc",
 ]
 
@@ -17,6 +29,31 @@ version = "0.1.0"
 name = "kernel"
 version = "0.1.0"
 dependencies = [
+ "bootproto",
  "init",
  "ipc",
 ]
+
+[[package]]
+name = "netstack"
+version = "0.1.0"
+
+[[package]]
+name = "runtime"
+version = "0.1.0"
+
+[[package]]
+name = "s3-service"
+version = "0.1.0"
+dependencies = [
+ "filesystem",
+ "security",
+]
+
+[[package]]
+name = "security"
+version = "0.1.0"
+
+[[package]]
+name = "storage"
+version = "0.1.0"

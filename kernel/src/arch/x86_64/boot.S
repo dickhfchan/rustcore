@@ -1,13 +1,12 @@
 /* Minimal PVH stage-0 loader that switches the CPU into 64-bit long mode
- * before tail-calling the Rust kernel entry (`kernel_main`).
+ * before tail-calling the Rust kernel entry (`rustcore_entry`).
  */
-
-.att_syntax prefix
 
 .section .text.boot, "ax"
 .code32
 .global _start
-.extern kernel_main
+.extern rustcore_entry
+.extern RUSTCORE_BOOTINFO
 
 _start:
     cli
@@ -64,7 +63,10 @@ long_mode_entry:
     movb $'K', %al
     out %al, %dx
 
-    call kernel_main
+    lea RUSTCORE_BOOTINFO(%rip), %rdi
+    mov %rsp, %rax
+    mov %rax, 8(%rdi)
+    call rustcore_entry
 
 1:
     hlt

@@ -1,0 +1,3 @@
+# Rustcore service manifest
+service:init:init_service.rlib:services_init::bootstrap:ipc,bootfs
+service:logger:logger.txt:logger::start:serial
