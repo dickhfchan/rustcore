@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+use alloc::borrow::ToOwned;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 

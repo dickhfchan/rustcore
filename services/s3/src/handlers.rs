@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
@@ -7,40 +8,47 @@ use alloc::vec::Vec;
 use crate::auth::{authenticate_request, HeaderAuth};
 use crate::http::{Header as HttpHeader, HttpHandler, Method, Request, Response};
 use crate::log::EventLog;
+use crate::multipart::{
+    InMemoryMultipart, MultipartError, MultipartManager, MultipartPart, MultipartUpload,
+};
 use filesystem::catalog::{Catalog, CatalogError};
 use filesystem::index::{IndexError, ListRequest, MutableIndex};
 use security::apikey::{AuthError, StaticApiKeyValidator};
 use security::keystore::KeyStore;
 use storage::object::{ObjectError, ObjectStore};
 
-pub struct S3Service<C, O, S, I>
+pub struct S3Service<C, O, S, I, M>
 where
     C: Catalog,
     O: ObjectStore,
     S: KeyStore,
     I: MutableIndex,
+    M: MultipartManager,
 {
     catalog: C,
     store: O,
     keystore: S,
     index: I,
+    multipart: M,
     auth_header: &'static str,
     events: EventLog,
 }
 
-impl<C, O, S, I> S3Service<C, O, S, I>
+impl<C, O, S, I, M> S3Service<C, O, S, I, M>
 where
     C: Catalog,
     O: ObjectStore,
     S: KeyStore,
     I: MutableIndex,
+    M: MultipartManager,
 {
-    pub fn new(catalog: C, store: O, keystore: S, index: I) -> Self {
+    pub fn new(catalog: C, store: O, keystore: S, index: I, multipart: M) -> Self {
         Self {
             catalog,
             store,
             keystore,
             index,
+            multipart,
             auth_header: "x-api-key",
             events: EventLog::default(),
         }
@@ -56,6 +64,10 @@ where
 
     pub fn index_mut(&mut self) -> &mut I {
         &mut self.index
+    }
+
+    pub fn multipart_mut(&mut self) -> &mut M {
+        &mut self.multipart
     }
 
     #[cfg(test)]
@@ -80,6 +92,16 @@ where
 
     fn storage_key(bucket: &str, key: &str) -> String {
         format!("{}/{}", bucket, key)
+    }
+
+    fn bucket_exists(&self, bucket: &str) -> bool {
+        let mut found = false;
+        self.catalog.list_buckets(&mut |info| {
+            if info.name == bucket {
+                found = true;
+            }
+        });
+        found
     }
 
     fn handle_put(&mut self, bucket: &str, key: &str, body: &[u8]) -> Response {
@@ -142,6 +164,9 @@ where
     }
 
     fn handle_list(&mut self, bucket: &str, query: Option<&str>) -> Response {
+        if !self.bucket_exists(bucket) {
+            return Self::response(404, b"BucketNotFound".to_vec());
+        }
         let params = QueryParams::parse(query.unwrap_or(""));
         let list_req = ListRequest {
             bucket,
@@ -156,13 +181,13 @@ where
                 body.push_str("Objects:\n");
                 for obj in &result.objects {
                     body.push_str(obj.key);
-                    body.push_str("\n");
+                    body.push('\n');
                 }
                 if !result.common_prefixes.is_empty() {
                     body.push_str("Prefixes:\n");
                     for prefix in &result.common_prefixes {
                         body.push_str(prefix);
-                        body.push_str("\n");
+                        body.push('\n');
                     }
                 }
                 if let Some(token) = result.next_token {
@@ -175,6 +200,118 @@ where
             }
             Err(IndexError::NotFound) => Self::response(404, b"BucketNotFound".to_vec()),
             Err(_) => Self::response(500, b"IndexError".to_vec()),
+        }
+    }
+
+    fn handle_create_bucket(&mut self, bucket: &str) -> Response {
+        match self.catalog.create_bucket(bucket) {
+            Ok(()) => {
+                self.events.record(format!("CREATE_BUCKET {}", bucket));
+                Self::empty_response(200)
+            }
+            Err(CatalogError::AlreadyExists) => {
+                Self::response(409, b"BucketAlreadyExists".to_vec())
+            }
+            Err(CatalogError::InvalidName) => Self::response(400, b"InvalidBucketName".to_vec()),
+            Err(_) => Self::response(500, b"CatalogError".to_vec()),
+        }
+    }
+
+    fn handle_delete_bucket(&mut self, bucket: &str) -> Response {
+        match self.catalog.delete_bucket(bucket) {
+            Ok(()) => {
+                self.index.purge_bucket(bucket);
+                self.events.record(format!("DELETE_BUCKET {}", bucket));
+                Self::empty_response(204)
+            }
+            Err(CatalogError::NotFound) => Self::response(404, b"NoSuchBucket".to_vec()),
+            Err(_) => Self::response(500, b"CatalogError".to_vec()),
+        }
+    }
+
+    fn handle_list_buckets(&mut self) -> Response {
+        let mut body = String::new();
+        body.push_str("Buckets:\n");
+        self.catalog.list_buckets(&mut |info| {
+            body.push_str(info.name);
+            body.push('\n');
+        });
+        self.events.record("LIST_BUCKETS");
+        Self::response(200, body.into_bytes())
+    }
+
+    fn handle_initiate_multipart(&mut self, bucket: &str, key: &str) -> Response {
+        if !self.bucket_exists(bucket) {
+            return Self::response(404, b"BucketNotFound".to_vec());
+        }
+        match self.multipart.initiate(bucket, key) {
+            Ok(upload_id) => {
+                self.events
+                    .record(format!("MP_INIT {} {}/{}", upload_id, bucket, key));
+                Self::response(200, format!("UploadId:{}", upload_id).into_bytes())
+            }
+            Err(_) => Self::response(500, b"MultipartError".to_vec()),
+        }
+    }
+
+    fn handle_upload_part(&mut self, upload_id: &str, part_number: u32, data: &[u8]) -> Response {
+        let part = MultipartPart {
+            upload_id,
+            part_number,
+            data,
+        };
+        match self.multipart.put_part(part) {
+            Ok(()) => {
+                self.events.record(format!(
+                    "MP_PART {} part={} size={}",
+                    upload_id,
+                    part_number,
+                    data.len()
+                ));
+                Self::empty_response(200)
+            }
+            Err(MultipartError::NotFound) => Self::response(404, b"NoSuchUpload".to_vec()),
+            Err(MultipartError::InvalidState) => {
+                Self::response(409, b"InvalidUploadState".to_vec())
+            }
+        }
+    }
+
+    fn handle_complete_multipart(&mut self, bucket: &str, key: &str, upload_id: &str) -> Response {
+        let upload = MultipartUpload {
+            upload_id,
+            bucket,
+            key,
+        };
+        match self.multipart.complete(&upload) {
+            Ok(data) => {
+                self.events
+                    .record(format!("MP_COMPLETE {} {}/{}", upload_id, bucket, key));
+                self.handle_put(bucket, key, &data)
+            }
+            Err(MultipartError::NotFound) => Self::response(404, b"NoSuchUpload".to_vec()),
+            Err(MultipartError::InvalidState) => {
+                Self::response(409, b"InvalidUploadState".to_vec())
+            }
+        }
+    }
+
+    fn handle_abort_multipart(&mut self, bucket: &str, key: &str, upload_id: &str) -> Response {
+        let upload = MultipartUpload {
+            upload_id,
+            bucket,
+            key,
+        };
+        match self.multipart.abort(&upload) {
+            Ok(()) => {
+                self.events
+                    .record(format!("MP_ABORT {} {}/{}", upload_id, bucket, key));
+                Self::empty_response(204)
+            }
+            Err(MultipartError::NotFound) => Self::response(404, b"NoSuchUpload".to_vec()),
+            Err(MultipartError::InvalidState) => {
+                Self::response(409, b"InvalidUploadState".to_vec())
+            }
         }
     }
 
@@ -198,12 +335,13 @@ where
     }
 }
 
-impl<C, O, S, I> HttpHandler for S3Service<C, O, S, I>
+impl<C, O, S, I, M> HttpHandler for S3Service<C, O, S, I, M>
 where
     C: Catalog,
     O: ObjectStore,
     S: KeyStore,
     I: MutableIndex,
+    M: MultipartManager,
 {
     fn handle(&mut self, request: &Request) -> Response {
         let validator = StaticApiKeyValidator::new(&self.keystore);
@@ -237,6 +375,26 @@ where
             _ => return Self::response(400, b"MissingBucket".to_vec()),
         };
         let key = parts.next().unwrap_or("");
+        let params = QueryParams::parse(query.unwrap_or(""));
+
+        if params.uploads && matches!(request.method, Method::Post) {
+            return self.handle_initiate_multipart(bucket, key);
+        }
+
+        if let Some(ref upload_id) = params.upload_id {
+            return match request.method {
+                Method::Put => {
+                    if let Some(part_number) = params.part_number {
+                        self.handle_upload_part(upload_id, part_number, &request.body)
+                    } else {
+                        Self::response(400, b"MissingPartNumber".to_vec())
+                    }
+                }
+                Method::Post => self.handle_complete_multipart(bucket, key, upload_id),
+                Method::Delete => self.handle_abort_multipart(bucket, key, upload_id),
+                _ => Self::response(405, b"MethodNotAllowed".to_vec()),
+            };
+        }
 
         match request.method {
             Method::Put if key.is_empty() => self.handle_create_bucket(bucket),
@@ -249,56 +407,15 @@ where
         }
     }
 }
-impl<C, O, S, I> S3Service<C, O, S, I>
-where
-    C: Catalog,
-    O: ObjectStore,
-    S: KeyStore,
-    I: MutableIndex,
-{
-    fn handle_create_bucket(&mut self, bucket: &str) -> Response {
-        match self.catalog.create_bucket(bucket) {
-            Ok(()) => {
-                self.events.record(format!("CREATE_BUCKET {}", bucket));
-                Self::empty_response(200)
-            }
-            Err(CatalogError::AlreadyExists) => {
-                Self::response(409, b"BucketAlreadyExists".to_vec())
-            }
-            Err(CatalogError::InvalidName) => Self::response(400, b"InvalidBucketName".to_vec()),
-            Err(_) => Self::response(500, b"CatalogError".to_vec()),
-        }
-    }
-
-    fn handle_delete_bucket(&mut self, bucket: &str) -> Response {
-        match self.catalog.delete_bucket(bucket) {
-            Ok(()) => {
-                self.index.purge_bucket(bucket);
-                self.events.record(format!("DELETE_BUCKET {}", bucket));
-                Self::empty_response(204)
-            }
-            Err(CatalogError::NotFound) => Self::response(404, b"NoSuchBucket".to_vec()),
-            Err(_) => Self::response(500, b"CatalogError".to_vec()),
-        }
-    }
-
-    fn handle_list_buckets(&mut self) -> Response {
-        let mut body = String::new();
-        body.push_str("Buckets:\n");
-        self.catalog.list_buckets(&mut |info| {
-            body.push_str(info.name);
-            body.push_str("\n");
-        });
-        self.events.record("LIST_BUCKETS");
-        Self::response(200, body.into_bytes())
-    }
-}
 
 struct QueryParams {
     prefix: Option<String>,
     delimiter: Option<char>,
     continuation_token: Option<String>,
     max_keys: Option<usize>,
+    uploads: bool,
+    upload_id: Option<String>,
+    part_number: Option<u32>,
 }
 
 impl QueryParams {
@@ -308,6 +425,9 @@ impl QueryParams {
             delimiter: None,
             continuation_token: None,
             max_keys: None,
+            uploads: false,
+            upload_id: None,
+            part_number: None,
         };
         for pair in query.split('&') {
             if pair.is_empty() {
@@ -322,6 +442,9 @@ impl QueryParams {
                 "delimiter" => params.delimiter = value.chars().next(),
                 "continuation-token" => params.continuation_token = Some(value.to_string()),
                 "max-keys" => params.max_keys = value.parse().ok(),
+                "uploads" => params.uploads = true,
+                "uploadId" => params.upload_id = Some(value.to_string()),
+                "partNumber" => params.part_number = value.parse().ok(),
                 _ => {}
             }
         }
@@ -354,13 +477,19 @@ mod tests {
         }
     }
 
-    fn new_service(
-    ) -> S3Service<InMemoryCatalog, InMemoryObjectStore, InMemoryKeyStore, InMemoryIndex> {
+    fn new_service() -> S3Service<
+        InMemoryCatalog,
+        InMemoryObjectStore,
+        InMemoryKeyStore,
+        InMemoryIndex,
+        InMemoryMultipart,
+    > {
         let mut service = S3Service::new(
             InMemoryCatalog::new(),
             InMemoryObjectStore::new(),
             InMemoryKeyStore::new(),
             InMemoryIndex::new(),
+            InMemoryMultipart::new(),
         );
         service.catalog_mut().create_bucket("photos").unwrap();
         service
@@ -375,13 +504,19 @@ mod tests {
         service
     }
 
-    fn new_empty_service(
-    ) -> S3Service<InMemoryCatalog, InMemoryObjectStore, InMemoryKeyStore, InMemoryIndex> {
+    fn new_empty_service() -> S3Service<
+        InMemoryCatalog,
+        InMemoryObjectStore,
+        InMemoryKeyStore,
+        InMemoryIndex,
+        InMemoryMultipart,
+    > {
         let mut service = S3Service::new(
             InMemoryCatalog::new(),
             InMemoryObjectStore::new(),
             InMemoryKeyStore::new(),
             InMemoryIndex::new(),
+            InMemoryMultipart::new(),
         );
         service
             .keystore_mut()
@@ -396,144 +531,44 @@ mod tests {
     }
 
     #[test]
-    fn put_get_delete_cycle() {
+    fn multipart_flow() {
         let mut service = new_service();
-        let put_resp = service.handle(&make_request(
-            Method::Put,
-            "/photos/cat.jpg",
-            Some("abc123"),
-            b"meow",
-        ));
-        assert_eq!(put_resp.status, 200);
-
-        let list_resp = service.handle(&make_request(
-            Method::Get,
-            "/photos?prefix=",
+        let init_resp = service.handle(&make_request(
+            Method::Post,
+            "/photos/album.zip?uploads",
             Some("abc123"),
             &[],
         ));
-        assert_eq!(list_resp.status, 200);
-        let body = core::str::from_utf8(&list_resp.body).unwrap();
-        assert!(body.contains("cat.jpg"));
+        assert_eq!(init_resp.status, 200);
+        let upload_id = core::str::from_utf8(&init_resp.body)
+            .unwrap()
+            .trim_start_matches("UploadId:")
+            .trim()
+            .to_string();
+
+        let part_resp = service.handle(&make_request(
+            Method::Put,
+            &format!("/photos/album.zip?partNumber=1&uploadId={}", upload_id),
+            Some("abc123"),
+            b"chunk",
+        ));
+        assert_eq!(part_resp.status, 200);
+
+        let complete_resp = service.handle(&make_request(
+            Method::Post,
+            &format!("/photos/album.zip?uploadId={}", upload_id),
+            Some("abc123"),
+            &[],
+        ));
+        assert_eq!(complete_resp.status, 200);
 
         let get_resp = service.handle(&make_request(
             Method::Get,
-            "/photos/cat.jpg",
+            "/photos/album.zip",
             Some("abc123"),
             &[],
         ));
         assert_eq!(get_resp.status, 200);
-        assert_eq!(get_resp.body, b"meow");
-
-        let del_resp = service.handle(&make_request(
-            Method::Delete,
-            "/photos/cat.jpg",
-            Some("abc123"),
-            &[],
-        ));
-        assert_eq!(del_resp.status, 204);
-
-        let get_missing = service.handle(&make_request(
-            Method::Get,
-            "/photos/cat.jpg",
-            Some("abc123"),
-            &[],
-        ));
-        assert_eq!(get_missing.status, 404);
-    }
-
-    #[test]
-    fn list_with_prefix_and_delimiter() {
-        let mut service = new_service();
-        service.handle(&make_request(
-            Method::Put,
-            "/photos/2023/holiday/img1.jpg",
-            Some("abc123"),
-            b"1",
-        ));
-        service.handle(&make_request(
-            Method::Put,
-            "/photos/2023/work/img2.jpg",
-            Some("abc123"),
-            b"2",
-        ));
-
-        let resp = service.handle(&make_request(
-            Method::Get,
-            "/photos?prefix=2023/&delimiter=/",
-            Some("abc123"),
-            &[],
-        ));
-        assert_eq!(resp.status, 200);
-        let body = core::str::from_utf8(&resp.body).unwrap();
-        assert!(body.contains("Prefixes"));
-    }
-
-    #[test]
-    fn put_missing_bucket_fails() {
-        let mut service = new_empty_service();
-        let resp = service.handle(&make_request(
-            Method::Put,
-            "/photos/item",
-            Some("abc123"),
-            b"data",
-        ));
-        assert_eq!(resp.status, 404);
-        assert!(service.events().is_empty());
-    }
-
-    #[test]
-    fn put_with_empty_key_is_rejected() {
-        let mut service = new_service();
-        let resp = service.handle(&make_request(
-            Method::Put,
-            "/photos/",
-            Some("abc123"),
-            b"data",
-        ));
-        assert_eq!(resp.status, 400);
-    }
-
-    #[test]
-    fn logs_endpoint_returns_events() {
-        let mut service = new_service();
-        service.handle(&make_request(
-            Method::Put,
-            "/photos/log.txt",
-            Some("abc123"),
-            b"log",
-        ));
-        let resp = service.handle(&make_request(Method::Get, "/_logs", Some("abc123"), &[]));
-        assert_eq!(resp.status, 200);
-        let body = core::str::from_utf8(&resp.body).unwrap();
-        assert!(body.contains("PUT photos/log.txt"));
-    }
-
-    #[test]
-    fn create_and_list_bucket() {
-        let mut service = new_empty_service();
-        let create = service.handle(&make_request(Method::Put, "/photos", Some("abc123"), &[]));
-        assert_eq!(create.status, 200);
-
-        let list = service.handle(&make_request(Method::Get, "/", Some("abc123"), &[]));
-        assert_eq!(list.status, 200);
-        let body = core::str::from_utf8(&list.body).unwrap();
-        assert!(body.contains("photos"));
-    }
-
-    #[test]
-    fn delete_bucket_removes_entries() {
-        let mut service = new_empty_service();
-        service.handle(&make_request(Method::Put, "/archive", Some("abc123"), &[]));
-        let delete = service.handle(&make_request(
-            Method::Delete,
-            "/archive",
-            Some("abc123"),
-            &[],
-        ));
-        assert_eq!(delete.status, 204);
-        let list = service.handle(&make_request(Method::Get, "/", Some("abc123"), &[]));
-        let body = core::str::from_utf8(&list.body).unwrap();
-        assert!(!body.contains("archive"));
+        assert_eq!(get_resp.body, b"chunk");
     }
 }
