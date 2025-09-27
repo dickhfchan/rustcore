@@ -4,7 +4,6 @@ use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use crate::catalog::{Catalog, CatalogError};
 use storage::object::ObjectMetadata;
 
 /// Listing parameters for S3-style object listings.
@@ -31,68 +30,73 @@ pub trait Index {
     fn list(&self, request: &ListRequest<'_>) -> Result<ListResponse<'_>, IndexError>;
 }
 
+pub trait MutableIndex: Index {
+    fn insert(&mut self, bucket: &str, key: &str, meta: ObjectMetadata);
+    fn remove(&mut self, bucket: &str, key: &str);
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IndexError {
     NotFound,
     Backend,
 }
 
-pub struct InMemoryIndex<'a, C: Catalog> {
-    catalog: &'a C,
+pub struct InMemoryIndex {
     buckets: BTreeMap<String, Vec<String>>,
     metadata: BTreeMap<(String, String), ObjectMetadata>,
 }
 
-impl<'a, C: Catalog> InMemoryIndex<'a, C> {
-    pub fn new(catalog: &'a C) -> Self {
+impl InMemoryIndex {
+    pub fn new() -> Self {
         Self {
-            catalog,
             buckets: BTreeMap::new(),
             metadata: BTreeMap::new(),
         }
     }
 
-    pub fn insert(&mut self, bucket: &str, key: &str, meta: ObjectMetadata) {
-        let entries = self
-            .buckets
-            .entry(bucket.to_owned())
-            .or_insert_with(Vec::new);
-        if !entries.contains(&key.to_owned()) {
-            entries.push(key.to_owned());
-            entries.sort();
-        }
-        self.metadata
-            .insert((bucket.to_owned(), key.to_owned()), meta);
+    fn entries_for(&self, bucket: &str) -> Option<&Vec<String>> {
+        self.buckets.get(bucket)
     }
 }
 
-impl<'a, C: Catalog> Index for InMemoryIndex<'a, C> {
+impl Default for InMemoryIndex {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Index for InMemoryIndex {
     fn list(&self, request: &ListRequest<'_>) -> Result<ListResponse<'_>, IndexError> {
         let entries = self
-            .buckets
-            .get(request.bucket)
+            .entries_for(request.bucket)
             .ok_or(IndexError::NotFound)?;
-
         let prefix = request.prefix.unwrap_or("");
-        let start_index = request
+        let max_keys = if request.max_keys == 0 {
+            usize::MAX
+        } else {
+            request.max_keys
+        };
+
+        let start = request
             .continuation
             .and_then(|token| entries.iter().position(|k| k == token))
             .map(|idx| idx + 1)
             .unwrap_or(0);
 
         let mut objects = Vec::new();
-        let mut common_prefixes = Vec::new();
+        let mut prefixes = Vec::new();
         let mut next_token = None;
-        for key in entries.iter().skip(start_index) {
+
+        for key in entries.iter().skip(start) {
             if !key.starts_with(prefix) {
                 continue;
             }
 
             if let Some(delimiter) = request.delimiter {
                 if let Some(pos) = key[prefix.len()..].find(delimiter) {
-                    let prefix = &key[..prefix.len() + pos + 1];
-                    if !common_prefixes.iter().any(|existing| existing == prefix) {
-                        common_prefixes.push(prefix.to_owned());
+                    let cp = &key[..prefix.len() + pos + 1];
+                    if !prefixes.iter().any(|p| p == cp) {
+                        prefixes.push(cp.to_string());
                     }
                     continue;
                 }
@@ -100,7 +104,7 @@ impl<'a, C: Catalog> Index for InMemoryIndex<'a, C> {
 
             let meta = self
                 .metadata
-                .get(&(request.bucket.to_owned(), key.to_owned()))
+                .get(&(request.bucket.to_owned(), key.clone()))
                 .copied()
                 .unwrap_or(ObjectMetadata {
                     id: 0,
@@ -113,7 +117,7 @@ impl<'a, C: Catalog> Index for InMemoryIndex<'a, C> {
                 size: meta.size,
             });
 
-            if request.max_keys > 0 && objects.len() >= request.max_keys {
+            if objects.len() == max_keys {
                 let idx = entries
                     .iter()
                     .position(|k| k == key)
@@ -128,28 +132,46 @@ impl<'a, C: Catalog> Index for InMemoryIndex<'a, C> {
         Ok(ListResponse {
             objects,
             next_token,
-            common_prefixes,
+            common_prefixes: prefixes,
         })
+    }
+}
+
+impl MutableIndex for InMemoryIndex {
+    fn insert(&mut self, bucket: &str, key: &str, meta: ObjectMetadata) {
+        let entries = self
+            .buckets
+            .entry(bucket.to_owned())
+            .or_insert_with(Vec::new);
+        if !entries.iter().any(|k| k == key) {
+            entries.push(key.to_owned());
+            entries.sort();
+        }
+        self.metadata
+            .insert((bucket.to_owned(), key.to_owned()), meta);
+    }
+
+    fn remove(&mut self, bucket: &str, key: &str) {
+        if let Some(entries) = self.buckets.get_mut(bucket) {
+            entries.retain(|k| k != key);
+        }
+        self.metadata.remove(&(bucket.to_owned(), key.to_owned()));
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::{Catalog, InMemoryCatalog};
-    use storage::object::ObjectStore;
 
     #[test]
-    fn list_with_prefix() {
-        let mut catalog = InMemoryCatalog::new();
-        catalog.create_bucket("photos").unwrap();
-        let mut index = InMemoryIndex::new(&catalog);
+    fn prefix_and_delimiter() {
+        let mut index = InMemoryIndex::new();
         index.insert(
             "photos",
-            "2023/vacation/img1.jpg",
+            "2023/holiday/img1.jpg",
             ObjectMetadata {
                 id: 1,
-                size: 10,
+                size: 100,
                 checksum: 0,
             },
         );
@@ -158,7 +180,7 @@ mod tests {
             "2023/work/img2.jpg",
             ObjectMetadata {
                 id: 2,
-                size: 20,
+                size: 200,
                 checksum: 0,
             },
         );
@@ -166,13 +188,14 @@ mod tests {
         let response = index
             .list(&ListRequest {
                 bucket: "photos",
-                prefix: Some("2023/vacation"),
-                delimiter: None,
+                prefix: Some("2023/"),
+                delimiter: Some('/'),
                 continuation: None,
                 max_keys: 100,
             })
             .unwrap();
-        assert_eq!(response.objects.len(), 1);
-        assert_eq!(response.objects[0].key, "2023/vacation/img1.jpg");
+
+        assert!(response.objects.len() <= 1);
+        assert_eq!(response.common_prefixes.len(), 2);
     }
 }

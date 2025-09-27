@@ -11,3 +11,4 @@ path = "src/lib.rs"
 [dependencies]
 filesystem = { path = "../../filesystem" }
 security = { path = "../../security" }
+storage = { path = "../../storage" }
