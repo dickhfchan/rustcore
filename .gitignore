@@ -8,11 +8,18 @@
 # Cargo
 Cargo.lock
 
-# Debug logs
+# Log files
 *.log
+*.log.*
 debug-*.log
 full_*.log
 qemu.log
+test-*.log
+build-*.log
+error-*.log
+info-*.log
+warn-*.log
+trace-*.log
 
 # IDE and editor files
 .vscode/
