@@ -53,3 +53,10 @@ simple_test
 
 # QEMU output files
 qemu-*.log
+
+# ISO files and disk images
+*.iso
+*.img
+*.bin
+*.elf
+
